@@ -1,5 +1,7 @@
 # Find THE Sock: dev tooling proposal (DRAFT)
 
+> **Update:** items 1–6 and the Edit-mode source tools (grep, lines, patch, push) are drafted in `sock-dev/` (see its README). They're not installed and haven't run yet.
+>
 > **Status: draft, not checked against the place.** This session ran in a cloud
 > container. It could not reach Roblox Studio (place 86617858096194) or
 > `C:\Users\trist\Downloads\Claude`, so I have not read `audit-fixes-log.md`,

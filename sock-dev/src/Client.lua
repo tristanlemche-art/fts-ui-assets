@@ -1,0 +1,726 @@
+-- SockDev client kit (Studio only). SockDevBoot copies it to
+-- ReplicatedStorage.SockDevRuntime only when RunService:IsStudio(), so it never
+-- reaches live servers. It is loaded on its own at spawn. From execute_luau (client):
+--   local D = _G.D or require(game.ReplicatedStorage.SockDevRuntime.Client)
+-- D.help() lists the API. Bindings and GUIs are found by name, so cleanup also
+-- works across separate script VMs.
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+
+local runtime = script.Parent
+local Ref = require(runtime:WaitForChild("Ref"))
+local Stations = require(runtime:WaitForChild("Stations"))
+
+local D = {}
+D.VERSION = 1
+D.Ref = Ref
+D.Stations = Stations
+D.find = Ref.find
+
+local CAM_BIND = "SockDevCam"
+local MIRROR_BIND = "SockDevMirror"
+local MIRROR_GUI = "SockDevMirror"
+local FAKE_ATTR = "SockDevFake"
+
+local function out(...)
+	print("[SockDev]", ...)
+end
+local function lp()
+	return Players.LocalPlayer
+end
+local function hrp()
+	local c = lp().Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function cam()
+	return workspace.CurrentCamera
+end
+
+-- ---------------------------------------------------------------- setup
+
+function D.setup()
+	_G.D = D
+	local p = lp()
+	local key = "NoSave_" .. p.UserId
+	local rf = runtime:FindFirstChild("Server")
+	if not runtime:GetAttribute(key) and rf then
+		pcall(rf.InvokeServer, rf, "NoSave")
+	end
+	local ok = runtime:GetAttribute(key) == true
+	out("ready v" .. D.VERSION .. " nosave=" .. tostring(ok))
+	return ok
+end
+
+-- ---------------------------------------------------------------- dev remote
+
+local function devRemote()
+	local sg = RS:FindFirstChild("SockGame")
+	local r = sg and sg:FindFirstChild("Remotes")
+	return r and r:FindFirstChild("DevAction")
+end
+
+-- D.dev("FillBag") / D.dev("AddCash", 1000): passes the arguments straight to DevAction.
+-- VERIFY the argument order against SockClient.DevUI on first use.
+function D.dev(action, ...)
+	local r = devRemote()
+	if not r then
+		return false, "DevAction remote not found"
+	end
+	if r:IsA("RemoteFunction") then
+		return true, r:InvokeServer(action, ...)
+	end
+	r:FireServer(action, ...)
+	return true
+end
+
+function D.tp(code)
+	return D.dev("Teleport", code)
+end
+
+-- ---------------------------------------------------------------- prompts
+
+-- Nearest enabled prompt to the character. action: ActionText/ObjectText substring (case-insensitive).
+function D.nearest(action, maxDist)
+	local root = hrp()
+	if not root then
+		return nil
+	end
+	local best, bestD = nil, maxDist or math.huge
+	local needle = action and string.lower(action)
+	for _, p in Ref.prompts(workspace) do
+		if p.Enabled then
+			local hay = string.lower(p.ActionText .. " " .. p.ObjectText .. " " .. p.Name)
+			if not needle or string.find(hay, needle, 1, true) then
+				local pos = Ref.worldPos(p)
+				if pos then
+					local d = (pos - root.Position).Magnitude
+					if d < bestD then
+						best, bestD = p, d
+					end
+				end
+			end
+		end
+	end
+	return best, bestD
+end
+
+-- Lists prompts within the radius (default 40). Returns a string.
+function D.prompts(radius)
+	local root = hrp()
+	if not root then
+		return "no character"
+	end
+	radius = radius or 40
+	local rows = {}
+	for _, p in Ref.prompts(workspace) do
+		local pos = Ref.worldPos(p)
+		if pos then
+			local d = (pos - root.Position).Magnitude
+			if d <= radius then
+				table.insert(rows, { d, string.format(
+					"%5.1f  %s  [%s | %s] hold=%.2g%s",
+					d,
+					Ref.path(p),
+					p.ActionText,
+					p.ObjectText,
+					p.HoldDuration,
+					p.Enabled and "" or " (disabled)"
+				) })
+			end
+		end
+	end
+	table.sort(rows, function(a, b)
+		return a[1] < b[1]
+	end)
+	local lines = {}
+	for _, r in rows do
+		table.insert(lines, r[2])
+	end
+	return table.concat(lines, "\n")
+end
+
+-- Resolves a prompt from: a ProximityPrompt, an Instance (first matching descendant),
+-- a station name (its .prompt, else the nearest one), a path, or nil (nearest).
+function D.prompt(x, action)
+	if typeof(x) == "Instance" then
+		if x:IsA("ProximityPrompt") then
+			return x
+		end
+		local needle = action and string.lower(action)
+		for _, d in x:GetDescendants() do
+			if d:IsA("ProximityPrompt") then
+				local hay = string.lower(d.ActionText .. " " .. d.ObjectText .. " " .. d.Name)
+				if not needle or string.find(hay, needle, 1, true) then
+					return d
+				end
+			end
+		end
+		return nil
+	end
+	if type(x) == "string" then
+		local st = Stations[x]
+		if st and st.prompt and not action then
+			local p = Ref.find(st.prompt)
+			if p then
+				return D.prompt(p)
+			end
+		end
+		if not st then
+			local inst = Ref.find(x)
+			if inst then
+				return D.prompt(inst, action)
+			end
+		end
+	end
+	return (D.nearest(action))
+end
+
+-- Holds the prompt for HoldDuration, then releases. It blocks for that long.
+function D.press(x, action)
+	local p = D.prompt(x, action)
+	if not p then
+		return false, "no prompt"
+	end
+	p:InputHoldBegin()
+	task.wait(p.HoldDuration + 0.05)
+	p:InputHoldEnd()
+	return true, Ref.path(p)
+end
+
+-- Client-only prompt for reaching UI states. Exclusivity = AlwaysShow.
+-- opts: like=<prompt|path|station> (copy a real prompt's style and attributes), parent=<path|Instance>,
+--       action, object, hold, range, attrs={...}
+-- If parent is omitted, it makes an invisible anchor part 4 studs in front of the character.
+-- Don't press fakes that the game's Prompts module forwards to the server.
+function D.fake(o)
+	o = o or {}
+	local parent = o.parent and Ref.find(o.parent)
+	if not parent then
+		local root = hrp()
+		assert(root, "no character")
+		local part = Instance.new("Part")
+		part.Name = "SockDevFakeAnchor"
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.Transparency = 1
+		part.Size = Vector3.one
+		part.CFrame = root.CFrame * CFrame.new(0, 0, -4)
+		part:SetAttribute(FAKE_ATTR, true)
+		part.Parent = workspace
+		parent = part
+	end
+	local like = o.like and D.prompt(o.like)
+	local p = like and like:Clone() or Instance.new("ProximityPrompt")
+	for _, d in p:GetChildren() do
+		if d:IsA("LuaSourceContainer") then
+			d:Destroy()
+		end
+	end
+	p.Name = "SockDevFake"
+	if o.action then
+		p.ActionText = o.action
+	end
+	if o.object then
+		p.ObjectText = o.object
+	end
+	p.HoldDuration = o.hold or (like and like.HoldDuration) or 0
+	p.Exclusivity = Enum.ProximityPromptExclusivity.AlwaysShow
+	p.RequiresLineOfSight = false
+	p.MaxActivationDistance = o.range or 20
+	p.Enabled = true
+	if o.attrs then
+		for k, v in o.attrs do
+			p:SetAttribute(k, v)
+		end
+	end
+	p:SetAttribute(FAKE_ATTR, true)
+	p.Parent = parent
+	return p
+end
+
+function D.clearFakes()
+	local n = 0
+	for _, d in workspace:GetDescendants() do
+		if d:GetAttribute(FAKE_ATTR) and d.Parent then
+			d:Destroy()
+			n += 1
+		end
+	end
+	return n
+end
+
+-- ---------------------------------------------------------------- camera
+
+-- Locks the camera every frame after the game's own camera code (Camera priority + 5).
+function D.lock(cf, fov)
+	assert(typeof(cf) == "CFrame", "lock(cf: CFrame, fov?)")
+	pcall(RunService.UnbindFromRenderStep, RunService, CAM_BIND)
+	local c = cam()
+	if c:GetAttribute("SockDevFov") == nil then
+		c:SetAttribute("SockDevFov", c.FieldOfView)
+	end
+	RunService:BindToRenderStep(CAM_BIND, Enum.RenderPriority.Camera.Value + 5, function()
+		local cc = workspace.CurrentCamera
+		cc.CameraType = Enum.CameraType.Scriptable
+		cc.CFrame = cf
+		if fov then
+			cc.FieldOfView = fov
+		end
+	end)
+	return cf
+end
+
+function D.unlock()
+	pcall(RunService.UnbindFromRenderStep, RunService, CAM_BIND)
+	local c = cam()
+	local f = c:GetAttribute("SockDevFov")
+	if f then
+		c.FieldOfView = f
+		c:SetAttribute("SockDevFov", nil)
+	end
+	c.CameraType = Enum.CameraType.Custom
+end
+
+-- Frames a station (its saved cam), an Instance or path, or the nearest prompt.
+-- Auto framing puts the camera on the character's side of the target, so the station's
+-- LookVector never matters. opts: dist(10) height(3) side(3) lookUp(1) fov
+function D.frame(x, o)
+	o = o or {}
+	local st = type(x) == "string" and Stations[x] or nil
+	if st and st.cam and not o.auto then
+		local c = st.cam
+		return D.lock(CFrame.lookAt(Vector3.new(c[1], c[2], c[3]), Vector3.new(c[4], c[5], c[6])), o.fov or st.fov)
+	end
+	local target
+	if typeof(x) == "Instance" then
+		target = x
+	elseif st and st.prompt then
+		target = Ref.find(st.prompt)
+	elseif type(x) == "string" and not st then
+		target = Ref.find(x)
+	end
+	target = target or D.nearest()
+	local tpos = target and Ref.worldPos(target)
+	local root = hrp()
+	if not tpos or not root then
+		return nil, "nothing to frame"
+	end
+	local dir = root.Position - tpos
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 0.1 then
+		dir = -root.CFrame.LookVector
+	end
+	dir = dir.Unit
+	local right = dir:Cross(Vector3.yAxis)
+	local pos = tpos + dir * (o.dist or 10) + Vector3.yAxis * (o.height or 3) + right * (o.side or 3)
+	return D.lock(CFrame.lookAt(pos, tpos + Vector3.yAxis * (o.lookUp or 1)), o.fov or (st and st.fov))
+end
+
+-- ---------------------------------------------------------------- movement
+
+local function waitMoved(before, timeout)
+	local t0 = os.clock()
+	repeat
+		task.wait(0.05)
+		local r = hrp()
+		if r and before and (r.Position - before).Magnitude > 4 then
+			return true
+		end
+	until os.clock() - t0 > (timeout or 2)
+	return false
+end
+
+-- Teleports by station or code, then sets the saved stand position or faces the station's prompt.
+function D.go(name)
+	local st = Stations[name]
+	local code = st and st.tp or (not st and name) or nil
+	local root = hrp()
+	if code then
+		local before = root and root.Position
+		D.tp(code)
+		waitMoved(before, 2)
+		task.wait(0.15)
+	end
+	root = hrp()
+	if not root then
+		return false, "no character"
+	end
+	if st and st.stand then
+		local s = st.stand
+		root.CFrame = CFrame.new(s[1], s[2], s[3]) * CFrame.Angles(0, math.rad(s[4] or 0), 0)
+	else
+		local p = (st and st.prompt and Ref.find(st.prompt)) or D.nearest()
+		local tpos = p and Ref.worldPos(p)
+		if tpos then
+			local flat = Vector3.new(tpos.X, root.Position.Y, tpos.Z)
+			if (flat - root.Position).Magnitude > 0.1 then
+				root.CFrame = CFrame.lookAt(root.Position, flat)
+			end
+		end
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
+-- Prints a registry line for the current character and camera (paste it via Ref.upsertStation).
+function D.record(name, tpCode)
+	local root = hrp()
+	assert(root, "no character")
+	local c = cam().CFrame
+	local lv = root.CFrame.LookVector
+	local yaw = math.deg(math.atan2(-lv.X, -lv.Z))
+	local t = c.Position + c.LookVector * 10
+	local st = Stations[name]
+	local tp = tpCode or (st and st.tp) or name
+	local line = string.format(
+		'["%s"] = { tp = %q, stand = {%.1f, %.1f, %.1f, %.0f}, cam = {%.1f, %.1f, %.1f, %.1f, %.1f, %.1f}, fov = %d },',
+		name, tp, root.Position.X, root.Position.Y, root.Position.Z, yaw,
+		c.Position.X, c.Position.Y, c.Position.Z, t.X, t.Y, t.Z, math.floor(cam().FieldOfView + 0.5)
+	)
+	print(line)
+	return line
+end
+
+-- ---------------------------------------------------------------- billboard mirror
+-- screen_capture does not draw BillboardGuis. The mirror clones each one into a
+-- ScreenGui at its projected screen position, size and offsets, and syncs the common
+-- visual properties every frame, so tweens and text changes still show.
+
+local SYNC = {
+	gui = { "Visible", "Size", "Position", "AnchorPoint", "Rotation", "BackgroundTransparency", "BackgroundColor3" },
+	text = { "Text", "TextTransparency", "TextColor3", "TextStrokeTransparency", "TextSize" },
+	image = { "Image", "ImageTransparency", "ImageColor3", "ImageRectOffset", "ImageRectSize" },
+	stroke = { "Enabled", "Transparency", "Color", "Thickness" },
+	grad = { "Enabled", "Offset", "Rotation", "Color", "Transparency" },
+	scale = { "Scale" },
+	group = { "GroupTransparency" },
+}
+
+local function syncList(i)
+	local l = {}
+	local function add(t)
+		for _, p in t do
+			table.insert(l, p)
+		end
+	end
+	if i:IsA("GuiObject") then
+		add(SYNC.gui)
+	end
+	if i:IsA("TextLabel") or i:IsA("TextButton") or i:IsA("TextBox") then
+		add(SYNC.text)
+	end
+	if i:IsA("ImageLabel") or i:IsA("ImageButton") then
+		add(SYNC.image)
+	end
+	if i:IsA("CanvasGroup") then
+		add(SYNC.group)
+	end
+	if i:IsA("UIStroke") then
+		add(SYNC.stroke)
+	end
+	if i:IsA("UIGradient") then
+		add(SYNC.grad)
+	end
+	if i:IsA("UIScale") then
+		add(SYNC.scale)
+	end
+	return l
+end
+
+local function pairUp(o, c, acc)
+	local l = syncList(o)
+	if #l > 0 then
+		table.insert(acc, { o, c, l })
+	end
+	local cc = c:GetChildren()
+	local used = {}
+	for _, oc in o:GetChildren() do
+		for j, ch in cc do
+			if not used[j] and ch.Name == oc.Name and ch.ClassName == oc.ClassName then
+				used[j] = true
+				pairUp(oc, ch, acc)
+				break
+			end
+		end
+	end
+end
+
+local M = { entries = {}, conns = {}, gui = nil }
+
+local function bbAnchor(bb)
+	local a = bb.Adornee or bb.Parent
+	if typeof(a) ~= "Instance" or not a:IsDescendantOf(workspace) then
+		return nil
+	end
+	return a
+end
+
+local function build(e)
+	if e.frame then
+		e.frame:Destroy()
+	end
+	local bb = e.bb
+	local f = Instance.new("Frame")
+	f.Name = bb.Name
+	f.BackgroundTransparency = 1
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.ClipsDescendants = bb.ClipsDescendants
+	f.Visible = false
+	local acc = {}
+	for _, ch in bb:GetChildren() do
+		if not ch:IsA("LuaSourceContainer") then
+			local ok, cl = pcall(ch.Clone, ch)
+			if ok and cl then
+				for _, d in cl:GetDescendants() do
+					if d:IsA("LuaSourceContainer") then
+						d:Destroy()
+					end
+				end
+				cl.Parent = f
+				pairUp(ch, cl, acc)
+			end
+		end
+	end
+	e.pairs = acc
+	e.frame = f
+	e.dirty = false
+	f.Parent = M.gui
+end
+
+local function track(bb)
+	if M.entries[bb] or not M.gui or bb:GetAttribute("SockDevNoMirror") then
+		return
+	end
+	local e = { bb = bb }
+	M.entries[bb] = e
+	build(e)
+	e.conn = bb.DescendantAdded:Connect(function()
+		e.dirty = true
+	end)
+end
+
+local function untrack(bb)
+	local e = M.entries[bb]
+	if e then
+		if e.conn then
+			e.conn:Disconnect()
+		end
+		if e.frame then
+			e.frame:Destroy()
+		end
+		M.entries[bb] = nil
+	end
+end
+
+local function step()
+	local c = workspace.CurrentCamera
+	local vp = c.ViewportSize
+	local tanHalf = math.tan(math.rad(c.FieldOfView) / 2)
+	for bb, e in M.entries do
+		local ok = pcall(function()
+			if not bb.Parent then
+				untrack(bb)
+				return
+			end
+			if e.dirty then
+				build(e)
+			end
+			local a = bbAnchor(bb)
+			local base = a and Ref.worldPos(a)
+			if not (bb.Enabled and base) then
+				e.frame.Visible = false
+				return
+			end
+			if a:IsA("BasePart") then
+				local half = a.Size / 2
+				base += a.CFrame:VectorToWorldSpace(bb.ExtentsOffsetWorldSpace * half)
+				base += c.CFrame:VectorToWorldSpace(bb.ExtentsOffset * half)
+			end
+			local pos = base + bb.StudsOffsetWorldSpace + c.CFrame:VectorToWorldSpace(bb.StudsOffset)
+			local sp = c:WorldToViewportPoint(pos)
+			if sp.Z <= 0.05 or (pos - c.CFrame.Position).Magnitude > bb.MaxDistance then
+				e.frame.Visible = false
+				return
+			end
+			local pps = vp.Y / (2 * sp.Z * tanHalf)
+			local w = bb.Size.X.Scale * pps + bb.Size.X.Offset
+			local h = bb.Size.Y.Scale * pps + bb.Size.Y.Offset
+			e.frame.Size = UDim2.fromOffset(w, h)
+			e.frame.Position = UDim2.fromOffset(sp.X + bb.SizeOffset.X * w, sp.Y - bb.SizeOffset.Y * h)
+			e.frame.ZIndex = math.max(1, 100000 - math.floor(sp.Z * 10))
+			e.frame.Visible = true
+			for _, pr in e.pairs do
+				local o, cl = pr[1], pr[2]
+				for _, prop in pr[3] do
+					local v = o[prop]
+					if cl[prop] ~= v then
+						cl[prop] = v
+					end
+				end
+			end
+		end)
+		if not ok then
+			untrack(bb)
+		end
+	end
+end
+
+-- D.mirror() / D.mirror(true) turns it on; D.mirror(false) turns it off. Returns the number of billboards tracked.
+function D.mirror(on)
+	local pg = lp():WaitForChild("PlayerGui")
+	if on == false then
+		pcall(RunService.UnbindFromRenderStep, RunService, MIRROR_BIND)
+		for _, cn in M.conns do
+			cn:Disconnect()
+		end
+		M.conns = {}
+		for bb in M.entries do
+			untrack(bb)
+		end
+		local g = pg:FindFirstChild(MIRROR_GUI)
+		if g then
+			g:Destroy()
+		end
+		M.gui = nil
+		return 0
+	end
+	if M.gui and M.gui.Parent then
+		local n = 0
+		for _ in M.entries do
+			n += 1
+		end
+		return n
+	end
+	local old = pg:FindFirstChild(MIRROR_GUI)
+	if old then
+		old:Destroy()
+	end
+	local g = Instance.new("ScreenGui")
+	g.Name = MIRROR_GUI
+	g.ResetOnSpawn = false
+	g.IgnoreGuiInset = true
+	g.DisplayOrder = -10 -- world-space signs sit under the HUD
+	g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	g.Parent = pg
+	M.gui = g
+	local function consider(d)
+		if d:IsA("BillboardGui") then
+			task.defer(track, d)
+		end
+	end
+	for _, root in { workspace, pg } do
+		for _, d in root:GetDescendants() do
+			if d:IsA("BillboardGui") then
+				track(d)
+			end
+		end
+		table.insert(M.conns, root.DescendantAdded:Connect(consider))
+	end
+	RunService:BindToRenderStep(MIRROR_BIND, Enum.RenderPriority.Camera.Value + 6, step)
+	local n = 0
+	for _ in M.entries do
+		n += 1
+	end
+	return n
+end
+
+-- ---------------------------------------------------------------- shot / snap / reset
+
+-- One call to get ready for a screenshot: go, settle, frame, mirror, and an optional press.
+-- opts: stay=true (skip go), settle(0.4), press="ActionText", pressIn=sec (async, so a short
+--       effect lands during the next screen_capture call), wait=sec, mirror=false, plus frame opts
+function D.shot(name, o)
+	o = o or {}
+	if not o.stay then
+		D.go(name)
+	end
+	task.wait(o.settle or 0.4)
+	D.frame(name, o)
+	if o.mirror ~= false then
+		D.mirror(true)
+	end
+	if o.press then
+		if o.pressIn then
+			task.delay(o.pressIn, D.press, name, o.press)
+		else
+			D.press(name, o.press)
+		end
+	end
+	if o.wait then
+		task.wait(o.wait)
+	end
+	return "READY " .. tostring(name)
+end
+
+local function fmt(v)
+	if typeof(v) == "number" then
+		return (v % 1 == 0) and tostring(v) or string.format("%.2f", v)
+	end
+	return tostring(v)
+end
+
+-- One-line state: leaderstats, player attributes, value folders, position, nearest station.
+function D.snap()
+	local p = lp()
+	local parts = {}
+	for _, ch in p:GetChildren() do
+		if ch:IsA("Folder") or ch:IsA("Configuration") then
+			local count = 0
+			for _, v in ch:GetDescendants() do
+				if v:IsA("ValueBase") and count < 40 then
+					count += 1
+					local key = ch.Name == "leaderstats" and v.Name or (ch.Name .. "." .. v.Name)
+					table.insert(parts, key .. "=" .. fmt(v.Value))
+				end
+			end
+		elseif ch:IsA("ValueBase") then
+			table.insert(parts, ch.Name .. "=" .. fmt(ch.Value))
+		end
+	end
+	for k, v in p:GetAttributes() do
+		table.insert(parts, "@" .. k .. "=" .. fmt(v))
+	end
+	table.sort(parts)
+	local root = hrp()
+	if root then
+		table.insert(parts, "pos=" .. Ref.v3(root.Position))
+		local np, nd = D.nearest()
+		if np then
+			table.insert(parts, string.format("near=%s(%.0f)", np.ActionText ~= "" and np.ActionText or Ref.path(np), nd))
+		end
+	end
+	table.insert(parts, "nosave=" .. tostring(runtime:GetAttribute("NoSave_" .. p.UserId) == true))
+	local line = table.concat(parts, " ")
+	print(line)
+	return line
+end
+
+function D.reset()
+	D.unlock()
+	D.mirror(false)
+	local n = D.clearFakes()
+	return "reset (" .. n .. " fakes removed)"
+end
+
+function D.help()
+	return [[
+SockDev (D = _G.D or require(game.ReplicatedStorage.SockDevRuntime.Client))
+ D.shot(name,{press=,pressIn=,wait=,stay=,mirror=false,dist=,height=,side=,fov=}) -> go+frame+mirror(+press)
+ D.go(name)          teleport (station tp or raw code) + stand / face the prompt
+ D.frame(x,{...})    lock the camera on a station cam, Instance/path, or the nearest prompt
+ D.lock(cf,fov) / D.unlock()
+ D.mirror(on)        BillboardGuis -> ScreenGui so screen_capture shows them
+ D.press(x,action)   InputHoldBegin/End on a resolved prompt
+ D.prompts(r)        list nearby prompts      D.nearest(action)
+ D.fake{like=,parent=,action=,object=,hold=,attrs=}   client-only AlwaysShow prompt
+ D.record(name)      print a registry line for the current character/camera
+ D.dev(action,...) / D.tp(code)   DevAction passthrough
+ D.snap()            one-line state         D.reset()  unlock+unmirror+clear fakes
+ D.Ref.dump()        markdown reference     D.Stations  registry table]]
+end
+
+return D
