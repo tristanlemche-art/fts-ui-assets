@@ -27,18 +27,30 @@ rf.Name = "Server"
 rf.Parent = rt
 rt.Parent = RS
 
-local function noSave(p)
-	local bf = SS:FindFirstChild("DevNoSave")
-	if not bf then
-		return false
+-- DevNoSave (SockServer.Dev) answers "no session" until the player's data has loaded,
+-- and may not exist yet when this script starts. Only a real "saving off" reply counts.
+local NOSAVE_OK = "saving off for this session"
+local function noSave(p, timeout)
+	local key = "NoSave_" .. p.UserId
+	if rt:GetAttribute(key) then
+		return true
 	end
-	local ok = pcall(function()
-		return bf:Invoke(p)
-	end)
-	if ok then
-		rt:SetAttribute("NoSave_" .. p.UserId, true)
-	end
-	return ok
+	local t0 = os.clock()
+	repeat
+		local bf = SS:FindFirstChild("DevNoSave")
+		if bf and p.Parent then
+			local ok, res = pcall(bf.Invoke, bf, p)
+			if ok and res == NOSAVE_OK then
+				rt:SetAttribute(key, true)
+				return true
+			end
+		end
+		if not p.Parent then
+			return false
+		end
+		task.wait(0.25)
+	until os.clock() - t0 > (timeout or 0)
+	return false
 end
 
 rf.OnServerInvoke = function(p, action)
@@ -56,7 +68,9 @@ local function onPlayer(p)
 			if not p.Character then
 				p.CharacterAdded:Wait()
 			end
-			noSave(p)
+			if not noSave(p, 30) then
+				warn("[SockDev] auto DevNoSave did not confirm for " .. p.Name .. "; run it by hand")
+			end
 		end)
 	end
 	if loader then

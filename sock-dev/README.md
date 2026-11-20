@@ -29,6 +29,12 @@
    - That DevNoSave after spawn is the same timing as before.
    - Whether `_G.D` from the LocalScript is visible to execute_luau. If it isn't, the `require(...)` fallback gives the same API.
    - Whether the game's custom prompt UI is a BillboardGui in PlayerGui (mirror covers it) or the CoreGui default (not capturable).
+   First run (2026-11-20) results:
+   - DevAction: OK. The server handler is `(player, action, arg)` and `actions.Teleport(player, s, where)`, so `D.tp(code)` is right. W2Gate teleport worked.
+   - DevNoSave: was broken. DevNoSave answers "no session" until data loads, and Boot set `NoSave_<id>` anyway, and never retried if DevNoSave didn't exist yet. Boot now retries for up to 30 s and only marks success on the "saving off for this session" reply (otherwise it warns). Still run the Server one-liner first in every playtest.
+   - `_G.D`: NOT visible to execute_luau (a separate VM). Always use `_G.D or require(game.ReplicatedStorage.SockDevRuntime.Client)`.
+   - Prompt UI: the custom sign is a BillboardGui in PlayerGui (`PlayerGui.Prompt`, adornee = the prompt part), so the mirror covers it.
+   - Also fixed: `Ref.grep(pattern, "<path to one script>")` returned nothing because it only searched descendants.
 5. Record a viewpoint for each station with `D.record` and `Ref.upsertStation`.
 6. Generate `sock-reference.md` with `Ref.dump()`.
 7. Log the install in `audit-fixes-log.md`.

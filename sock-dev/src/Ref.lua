@@ -231,7 +231,11 @@ function Ref.grep(pattern, rootPath, max)
 			}
 		or { root }
 	for _, r in roots do
-		for _, d in r:GetDescendants() do
+		local list = r:GetDescendants()
+		if r:IsA("LuaSourceContainer") then
+			table.insert(list, 1, r) -- a single script as root: search the script itself
+		end
+		for _, d in list do
 			if d:IsA("LuaSourceContainer") then
 				local ok, src = pcall(getSource, d)
 				if ok then
